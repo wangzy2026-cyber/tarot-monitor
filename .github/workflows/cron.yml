@@ -35,11 +35,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. 安装 Playwright 浏览器（Chromium）──────
+      # ── 4. 修复 Ubuntu 24.04 (Noble) libasound2 兼容问题 ──
+      - name: 🔧 Fix libasound2 for Ubuntu Noble
+        run: |
+          sudo apt-get update -qq
+          # Noble 上 libasound2 已改名为 libasound2t64，手动建立软链兼容
+          sudo apt-get install -y libasound2t64 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 \
+            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxss1 \
+            libxtst6 xvfb --no-install-recommends 2>/dev/null || true
+          # 若系统没有 libasound2 符号包，手动创建软链让 Playwright 找到
+          if ! ldconfig -p | grep -q 'libasound.so.2'; then
+            ASOUND_LIB=$(ldconfig -p | grep 'libasound' | awk '{print $NF}' | head -1)
+            if [ -n "$ASOUND_LIB" ]; then
+              sudo ln -sf "$ASOUND_LIB" /usr/lib/x86_64-linux-gnu/libasound.so.2 2>/dev/null || true
+            fi
+          fi
+
+      # ── 5. 安装 Playwright 浏览器（Chromium）──────
       - name: 🌐 Install Playwright Chromium
         run: |
-          playwright install chromium
-          playwright install-deps chromium
+          # 使用 --with-deps 让 playwright 自行处理依赖，跳过有问题的 install-deps
+          playwright install --with-deps chromium
 
       # ── 5. 执行监控脚本 ────────────────────────────
       - name: 🚀 Run monitor script
