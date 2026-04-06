@@ -12,64 +12,52 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 def get_stats():
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     
-    print("--- 正在调用 RPC 获取聚合数据 ---")
-    rpc_res = supabase.rpc("get_daily_stats").execute()
+    print("--- 正在通过 RPC 获取最终准确数据 ---")
+    # 调用新函数名：get_daily_stats_final
+    rpc_res = supabase.rpc("get_daily_stats_final").execute()
     stats = rpc_res.data[0] if rpc_res.data else {"t_flips": 0, "t_uv": 0}
     
     flips = stats.get("t_flips", 0)
     uv = stats.get("t_uv", 0)
-    print(f"聚合结果: UV={uv}, 次数={flips}")
 
-    # 获取最新 5 条提问
+    # 获取最新 5 条提问，做极简处理
     q_res = supabase.table("tarot_history")\
-        .select("question, created_at")\
+        .select("question")\
         .not_.is_("question", "null")\
         .order("created_at", desc=True)\
         .limit(30).execute()
     
     seen, qs = set(), []
     for row in (q_res.data or []):
-        q = (row['question'] or "").strip().replace('"', "'")
+        q = (row['question'] or "").strip().replace("\n", " ")
         if len(q) > 2 and q not in seen:
             seen.add(q)
-            utc_dt = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
-            bj_time = utc_dt.astimezone(BEIJING_TZ).strftime("%H:%M")
-            qs.append(f"• [{bj_time}] {q}")
+            qs.append(f"· {q}")
         if len(qs) >= 5: break
             
     return uv, flips, qs
 
 def push_feishu(uv, flips, qs):
     now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
-    q_text = "\n".join(qs) if qs else "今日暂无有效提问"
+    
+    # 构建纯文本消息，绕过复杂的卡片解析器
+    # 使用 Markdown 格式在飞书机器人中依然有良好的视觉效果
+    content = f"🔮 **Zen Tarot 运营简报**\n" \
+              f"---------------------------\n" \
+              f"📅 统计日期：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')}\n" \
+              f"👤 独立用户 (UV)：**{uv}**\n" \
+              f"🃏 占卜总次数：**{flips}**\n" \
+              f"---------------------------\n" \
+              f"❓ **最新提问：**\n" + "\n".join(qs) + \
+              f"\n\n⏰ 更新时间：{now_str}"
 
-    # --- 这里是物理意义上的最简结构，绝不嵌套 ---
     payload = {
-        "msg_type": "interactive",
-        "card": {
-            "header": {
-                "title": {"tag": "plain_text", "content": "🔮 Zen Tarot 运营速报"},
-                "template": "purple"
-            },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"**📊 今日实时数据 (SQL聚合)**\n👤 独立用户 (UV)：**{uv}**\n🃏 占卜总次数：**{flips:,}**"
-                },
-                {"tag": "hr"},
-                {
-                    "tag": "markdown",
-                    "content": f"**❓ 最新提问**\n{q_text}"
-                },
-                {
-                    "tag": "note",
-                    "content": {"tag": "plain_text", "content": f"最后更新：{now_str}"}
-                }
-            ]
+        "msg_type": "text", # 这一行是关键，改用纯文本模式
+        "content": {
+            "text": content
         }
     }
     
-    # 强制不使用任何 json.dumps，由 requests 库处理
     r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
     print(f"飞书返回结果: {r.text}")
 
