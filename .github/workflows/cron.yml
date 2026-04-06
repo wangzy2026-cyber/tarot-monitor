@@ -2,13 +2,13 @@ name: 🔮 Zen Tarot 看板自动更新
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 每小时运行一次
-  workflow_dispatch:      # 支持手动点击运行
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:         # 🌟 显式声明读写权限
+    permissions:
       contents: write
     
     steps:
@@ -21,17 +21,21 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 📦 Install deps
+      - name: 📦 Install deps (Noble fix)
         run: |
           pip install -r requirements.txt
-          python -m playwright install chromium --with-deps
+          # 🌟 关键修复：强制安装兼容 Noble 的依赖，并跳过系统包检查直接装浏览器
+          python -m playwright install chromium
+          # 手动安装缺失的系统库（绕过 libasound2 的包名问题）
+          sudo apt-get update
+          sudo apt-get install -y libgbm1 libasound2t64 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libpango-1.0-0 libpangocairo-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6
 
       - name: 🚀 Run Script
         env:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python monitor.py
 
-      - name: 💾 Commit and Push Changes  # 🌟 存盘步骤：把生成的 JSON 推回仓库
+      - name: 💾 Commit and Push Changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
