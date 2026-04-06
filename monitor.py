@@ -1,54 +1,57 @@
 import os
 import requests
+import json
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 
-# --- 基础配置 (从环境变量读取 Key) ---
+# --- 配置 ---
 SUPABASE_URL = "https://ybragvmvirddqfotqxig.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 def get_stats():
+    print(f"正在连接 Supabase...")
+    if not SUPABASE_KEY:
+        raise ValueError("环境变量 SUPABASE_KEY 为空，请检查 GitHub Secrets 配置！")
+    
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     
-    # 逻辑 A：今日聚合统计 (北京时间 0 点起)
+    # 逻辑 A：今日数据
     today_bj = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     today_utc = today_bj.astimezone(timezone.utc).isoformat()
+    print(f"查询今日数据 (UTC 起始时间: {today_utc})...")
     
-    # 统计今日所有数据
     res = supabase.table("tarot_history").select("anonymous_id").gte("created_at", today_utc).execute()
     data = res.data or []
     total_flips = len(data)
     uv = len(set(row['anonymous_id'] for row in data))
+    print(f"今日结果: UV={uv}, 次数={total_flips}")
     
-    # 逻辑 B：最新 100 条有效提问 (去重逻辑)
+    # 逻辑 B：最新提问
+    print("查询最新提问...")
     q_res = supabase.table("tarot_history")\
         .select("question, created_at")\
         .not_.is_("question", "null")\
         .order("created_at", desc=True)\
-        .limit(300).execute() # 采样 300 条进行侧端去重
+        .limit(200).execute()
     
-    seen_questions = set()
-    latest_questions = []
+    seen = set()
+    qs = []
     for row in (q_res.data or []):
         q = row['question'].strip()
-        # 长度大于 2 且未出现过
-        if len(q) > 2 and q not in seen_questions:
-            seen_questions.add(q)
-            # 转换显示时间为北京时间
+        if len(q) > 2 and q not in seen:
+            seen.add(q)
             utc_dt = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
             bj_time = utc_dt.astimezone(BEIJING_TZ).strftime("%H:%M")
-            latest_questions.append(f"[{bj_time}] {q}")
-        if len(latest_questions) >= 100:
-            break
-            
-    return uv, total_flips, latest_questions
+            qs.append(f"[{bj_time}] {q}")
+        if len(qs) >= 100: break
+    
+    return uv, total_flips, qs
 
 def push_feishu(uv, flips, qs):
-    # 飞书卡片只展示前 10 个问题预览，避免消息过长，完整列表可在多维表格看（如果需要）
+    print(f"正在推送至飞书 Webhook...")
     q_display = "\n".join(qs[:15]) + (f"\n...等共 {len(qs)} 条" if len(qs) > 15 else "")
-    
     now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
     
     card = {
@@ -56,21 +59,16 @@ def push_feishu(uv, flips, qs):
         "card": {
             "header": {"title": {"tag": "plain_text", "content": "🔮 Zen Tarot 运营速报"}, "template": "purple"},
             "body": {"elements": [
-                {"tag": "markdown", "content": f"**📅 统计时间：** {now_str}"},
+                {"tag": "markdown", "content": f"**📊 今日实时数据**\n👤 独立用户 (UV)：**{uv}**\n🃏 翻牌总次数：**{flips}**\n🕒 统计时间：{now_str}"},
                 {"tag": "hr"},
-                {"tag": "markdown", "content": f"**📊 今日实时数据**\n👤 独立用户 (UV)：**{uv}**\n🃏 翻牌总次数：**{flips}**"},
-                {"tag": "hr"},
-                {"tag": "markdown", "content": f"**❓ 最新用户提问 (去重)**\n{q_display or '暂无提问'}"},
-                {"tag": "note", "content": {"tag": "plain_text", "content": "数据由 GitHub Actions 自动推送"}}
+                {"tag": "markdown", "content": f"**❓ 最新用户提问 (去重)**\n{q_display or '暂无提问'}"}
             ]}
         }
     }
-    requests.post(FEISHU_WEBHOOK, json=card)
+    r = requests.post(FEISHU_WEBHOOK, json=card)
+    print(f"飞书返回状态码: {r.status_code}")
+    print(f"飞书返回内容: {r.text}")
 
 if __name__ == "__main__":
-    try:
-        uv, flips, qs = get_stats()
-        push_feishu(uv, flips, qs)
-        print("✅ 飞书推送成功")
-    except Exception as e:
-        print(f"❌ 运行出错: {e}")
+    uv, flips, qs = get_stats()
+    push_feishu(uv, flips, qs)
