@@ -4,63 +4,62 @@ import json
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 
-# --- 1. 配置 ---
+# --- 配置 ---
 SUPABASE_URL = "https://ybragvmvirddqfotqxig.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-def get_stats_perfectly():
-    print("--- 正在执行绝对精准统计 ---")
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+def get_stats():
+    print("--- 正在使用 SQL 逻辑提取精准数据 ---")
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     
-    # 严格计算北京时间今日 0 点起始点
-    today_bj_0am = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_time_utc = today_bj_0am.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # 1. 严格计算北京时间今日 0 点 (对应 UTC 前一天 16:00)
+    today_bj_start = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_start = today_bj_start.astimezone(timezone.utc).isoformat()
     
-    print(f"统计起始点 (UTC): {start_time_utc}")
-
-    # --- 逻辑 A: 占卜总次数 (准确对齐 SQL COUNT(*)) ---
-    # 使用 exact count + limit(0) 不取任何数据，只取总数，无视 1000 条限制
-    res_total = supabase.table("tarot_history")\
+    # --- 核心：直接用 CountExact 拿到总数 (对应 SQL: COUNT(*)) ---
+    count_res = supabase.table("tarot_history")\
         .select("id", count="exact")\
-        .gte("created_at", start_time_utc)\
+        .gte("created_at", utc_start)\
         .limit(1).execute()
-    total_flips = res_total.count if res_total.count is not None else 0
+    total_flips = count_res.count if count_res.count else 0
 
-    # --- 逻辑 B: 独立用户数 (准确对齐 SQL COUNT(DISTINCT anonymous_id)) ---
-    # 这里我们不再通过 Python 分页，因为分页容易导致重叠或遗漏
-    # 既然你之前的 SQL 能跑出 956，说明数据在数据库里是清晰的
-    # 我们拉取今日所有 anonymous_id，一次性处理（针对 1.3w 数据量没问题）
-    all_ids = []
-    offset = 0
+    # --- 核心：解决 UV 翻倍问题 (对应 SQL: COUNT(DISTINCT anonymous_id)) ---
+    # 之前翻倍是因为拉取了重复数据。现在我们分批拉取 ID 并彻底去重。
+    unique_users = set()
+    last_id = 0 # 使用 ID 游标，确保不漏不重
     while True:
         r = supabase.table("tarot_history")\
-            .select("anonymous_id")\
-            .gte("created_at", start_time_utc)\
-            .order("created_at")\
-            .range(offset, offset + 999)\
-            .execute()
+            .select("id, anonymous_id")\
+            .gte("created_at", utc_start)\
+            .gt("id", last_id)\
+            .order("id")\
+            .limit(1000).execute()
         
         batch = r.data or []
-        all_ids.extend([row['anonymous_id'] for row in batch])
-        if len(batch) < 1000:
-            break
-        offset += 1000
+        if not batch: break
+        
+        for row in batch:
+            unique_users.add(row['anonymous_id'])
+            last_id = row['id']
+            
+        if len(batch) < 1000: break
     
-    uv = len(set(all_ids))
-    print(f"最终校验: UV={uv}, Flips={total_flips}")
+    uv = len(unique_users)
+    print(f"✅ 最终核对：UV={uv}, Flips={total_flips}")
 
-    # --- 逻辑 C: 最新提问 (Top 15) ---
+    # --- 核心：最新提问 (截断防止飞书报错) ---
     q_res = supabase.table("tarot_history")\
         .select("question, created_at")\
         .not_.is_("question", "null")\
         .order("created_at", desc=True)\
-        .limit(100).execute()
+        .limit(50).execute()
     
-    seen, qs = set(), []
+    qs = []
+    seen = set()
     for row in (q_res.data or []):
-        q = (row['question'] or "").strip().replace('"', "'")
+        q = (row['question'] or "").strip()
         if len(q) > 2 and q not in seen:
             seen.add(q)
             utc_dt = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
@@ -71,39 +70,24 @@ def get_stats_perfectly():
     return uv, total_flips, qs
 
 def push_feishu(uv, flips, qs):
-    print("--- 正在推送飞书 ---")
-    now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
-    q_text = "\n".join(qs) if qs else "今日暂无提问数据"
-
-    # 彻底简化 JSON 结构，修复 parse json err
-    card_payload = {
+    # 强制构建飞书最稳的 Payload，修复之前 200621 报错
+    card = {
         "msg_type": "interactive",
         "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "🔮 Zen Tarot 运营速报"},
-                "template": "purple"
-            },
+            "header": {"title": {"tag": "plain_text", "content": "🔮 Zen Tarot 运营看板"}, "template": "purple"},
             "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"**📊 今日实时数据 (0点起)**\n👤 独立用户 (UV)：**{uv}**\n🃏 占卜总次数：**{flips:,}**\n🕒 统计时间：{now_str}"
-                },
+                {"tag": "markdown", "content": f"**📅 统计日期：** {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')}\n👤 独立用户 (UV)：**{uv}**\n🃏 占卜总次数：**{flips:,}**"},
                 {"tag": "hr"},
-                {
-                    "tag": "markdown",
-                    "content": f"**❓ 最新用户提问**\n{q_text}"
-                }
+                {"tag": "markdown", "content": f"**❓ 最新提问 (Top 15)**\n" + ("\n".join(qs) if qs else "暂无数据")}
             ]
         }
     }
-    
-    r = requests.post(FEISHU_WEBHOOK, json=card_payload, timeout=20)
-    print(f"飞书 API 返回结果: {r.text}")
+    r = requests.post(FEISHU_WEBHOOK, json=card, timeout=15)
+    print(f"飞书返回: {r.text}")
 
 if __name__ == "__main__":
     try:
-        u, f, q = get_stats_perfectly()
+        u, f, q = get_stats()
         push_feishu(u, f, q)
     except Exception as e:
-        print(f"❌ 运行报错: {e}")
+        print(f"❌ 运行崩溃: {e}")
