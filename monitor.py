@@ -25,13 +25,12 @@ SUPABASE_KEY = (
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-
 # ─────────────────────────────────────────────
 # 工具
 # ─────────────────────────────────────────────
 
 def beijing_today_utc_range():
-    """返回北京时间今日 00:00 ~ 明日 00:00 对应的 UTC ISO 字符串"""
+    """北京时间今日 00:00 ~ 明日 00:00 → UTC ISO 字符串"""
     now_bj = datetime.now(BEIJING_TZ)
     start_bj = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
     end_bj = start_bj + timedelta(days=1)
@@ -45,11 +44,10 @@ def now_bj_str():
     return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def fmt_num(val):
-    """把数字字符串格式化为带千分位的形式，N/A 原样返回"""
-    if val == "N/A" or val is None:
+    if val in ("N/A", None, ""):
         return "N/A"
     try:
-        return f"{int(str(val).replace(',','')):,}"
+        return f"{int(str(val).replace(',', '')):,}"
     except Exception:
         return str(val)
 
@@ -71,8 +69,7 @@ async def scrape_threads() -> dict:
         browser = await p.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
+                "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
             ],
@@ -92,33 +89,29 @@ async def scrape_threads() -> dict:
             "window.chrome={runtime:{}};"
         )
 
+        # 拦截 GraphQL 响应
+        api_payloads = []
         page = await context.new_page()
-        # 屏蔽媒体资源，加速加载
+
+        async def capture_response(response):
+            if "graphql" in response.url:
+                try:
+                    body = await response.json()
+                    api_payloads.append(body)
+                except Exception:
+                    pass
+
+        page.on("response", capture_response)
         await page.route(
-            "**/*.{png,jpg,jpeg,gif,webp,mp4,webm,woff,woff2,svg}",
+            "**/*.{png,jpg,jpeg,gif,webp,mp4,webm,woff,woff2}",
             lambda r: r.abort()
         )
-
-        # 拦截 XHR/Fetch，捕获 Threads GraphQL 响应
-        api_payloads = []
-        def handle_response(response):
-            url = response.url
-            if "api/graphql" in url or "graphql" in url:
-                async def capture():
-                    try:
-                        body = await response.json()
-                        api_payloads.append(body)
-                    except Exception:
-                        pass
-                asyncio.ensure_future(capture())
-        page.on("response", handle_response)
 
         try:
             print(f"[Threads] 访问: {THREADS_URL}")
             await page.goto(THREADS_URL, wait_until="domcontentloaded", timeout=60000)
-
-            # 等待 JS 渲染
             await asyncio.sleep(random.uniform(5, 8))
+
             try:
                 await page.wait_for_selector(
                     'article, [role="article"], div[data-pressable-container]',
@@ -126,43 +119,43 @@ async def scrape_threads() -> dict:
                 )
             except Exception:
                 pass
+
+            # 滚动触发更多内容加载
+            await page.evaluate("window.scrollBy(0, 800)")
+            await asyncio.sleep(random.uniform(2, 3))
+            await page.evaluate("window.scrollBy(0, 800)")
             await asyncio.sleep(random.uniform(1, 2))
-            await page.evaluate("window.scrollBy(0, 500)")
-            await asyncio.sleep(random.uniform(1.5, 2.5))
 
             html = await page.content()
 
-            # ── 解析：从拦截的 GraphQL JSON 提取 ──────────
-            all_json_str = json.dumps(api_payloads)
-            # 也把页面内嵌 script JSON 一起搜
-            inline_jsons = re.findall(
+            # 把内嵌 JSON script 也加入
+            for block in re.findall(
                 r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
                 html, re.DOTALL
-            )
-            for block in inline_jsons:
+            ):
                 try:
                     api_payloads.append(json.loads(block))
                 except Exception:
                     pass
-            all_json_str = json.dumps(api_payloads)
 
+            all_json_str = json.dumps(api_payloads, ensure_ascii=False)
+
+            # ── 提取帖子指标 ──────────────────────────────
             field_map = {
                 "likes":   ["like_count", "likeCount"],
                 "reposts": ["repost_count", "repostCount", "reshare_count"],
                 "replies": ["reply_count", "replyCount", "direct_reply_count"],
-                "views":   ["play_count", "view_count", "viewCount", "video_play_count",
-                            "impression_count", "reach_count"],
+                "views":   ["play_count", "view_count", "viewCount",
+                            "video_play_count", "impression_count"],
             }
+            # 先从 GraphQL + JSON 提取
             for field, keys in field_map.items():
-                if result[field] != "N/A":
-                    continue
                 for key in keys:
                     m = re.search(rf'"{key}"\s*:\s*(\d+)', all_json_str)
                     if m:
                         result[field] = m.group(1)
                         break
-
-            # ── 备用：直接搜原始 HTML ──────────────────────
+            # 再从原始 HTML 兜底
             for field, keys in field_map.items():
                 if result[field] != "N/A":
                     continue
@@ -171,64 +164,79 @@ async def scrape_threads() -> dict:
                     if m:
                         result[field] = m.group(1)
                         break
+            # aria-label 最后兜底
+            try:
+                labels = await page.evaluate(
+                    "()=>Array.from(document.querySelectorAll('[aria-label]'))"
+                    ".map(e=>e.getAttribute('aria-label'))"
+                    ".filter(l=>l&&/\\d/.test(l))"
+                )
+                for label in labels:
+                    ll = label.lower()
+                    num_m = re.search(r'([\d,]+)', label)
+                    if not num_m:
+                        continue
+                    num = num_m.group(1)
+                    if result["likes"] == "N/A" and ("like" in ll or "赞" in ll):
+                        result["likes"] = num
+                    if result["reposts"] == "N/A" and ("repost" in ll or "转发" in ll):
+                        result["reposts"] = num
+                    if result["replies"] == "N/A" and ("repl" in ll or "回复" in ll):
+                        result["replies"] = num
+            except Exception:
+                pass
 
-            # ── 备用：aria-label 提取 ──────────────────────
-            if any(result[f] == "N/A" for f in ["likes", "reposts", "replies"]):
-                try:
-                    labels = await page.evaluate(
-                        "() => Array.from(document.querySelectorAll('[aria-label]'))"
-                        ".map(el=>el.getAttribute('aria-label'))"
-                        ".filter(l=>l&&/\\d/.test(l))"
-                    )
-                    for label in labels:
-                        ll = label.lower()
-                        if result["likes"] == "N/A" and ("like" in ll or "赞" in ll):
-                            m = re.search(r'([\d,]+)', label)
-                            if m: result["likes"] = m.group(1)
-                        if result["reposts"] == "N/A" and ("repost" in ll or "转发" in ll):
-                            m = re.search(r'([\d,]+)', label)
-                            if m: result["reposts"] = m.group(1)
-                        if result["replies"] == "N/A" and ("repl" in ll or "回复" in ll):
-                            m = re.search(r'([\d,]+)', label)
-                            if m: result["replies"] = m.group(1)
-                except Exception:
-                    pass
+            # ── 提取最新 10 条评论（按时间倒序）────────────
+            # 策略：从 GraphQL payload 提取评论对象，保留时间戳用于排序
+            comment_objs = []  # [{text, timestamp}]
 
-            # ── 抓取今日新增回复内容（最新 10 条）────────────
-            # 优先从 GraphQL payload 提取评论文本
-            comment_texts = []
             for payload in api_payloads:
                 dumped = json.dumps(payload, ensure_ascii=False)
-                # Threads 评论文本一般在 text_with_entities.text 或 caption.text
-                texts = re.findall(r'"text"\s*:\s*"((?:[^"\\]|\\.){8,200})"', dumped)
-                for t in texts:
-                    t = t.replace("\\n", " ").replace('\\"', '"').strip()
-                    if t not in comment_texts and len(t) >= 8:
-                        comment_texts.append(t)
-                if len(comment_texts) >= 30:
+                # 找所有含 text + taken_at 的评论对象
+                # Threads 评论结构：{"text":"...","taken_at":1234567890,...}
+                matches = re.finditer(
+                    r'"taken_at"\s*:\s*(\d+).*?"text"\s*:\s*"((?:[^"\\]|\\.){8,300})"'
+                    r'|"text"\s*:\s*"((?:[^"\\]|\\.){8,300})".*?"taken_at"\s*:\s*(\d+)',
+                    dumped
+                )
+                for m in matches:
+                    if m.group(1):
+                        ts, text = int(m.group(1)), m.group(2)
+                    else:
+                        ts, text = int(m.group(4)), m.group(3)
+                    text = text.replace("\\n", " ").replace('\\"', '"').strip()
+                    comment_objs.append({"text": text, "ts": ts})
+
+            # 去重 + 按时间倒序
+            seen_texts = set()
+            unique_comments = []
+            for obj in sorted(comment_objs, key=lambda x: x["ts"], reverse=True):
+                t = obj["text"]
+                if t not in seen_texts:
+                    seen_texts.add(t)
+                    unique_comments.append(t)
+                if len(unique_comments) >= 10:
                     break
 
-            # DOM 选择器兜底
-            if len(comment_texts) < 5:
+            # DOM 兜底（如果 GraphQL 没拿到评论）
+            if len(unique_comments) < 3:
                 selectors = [
                     'div[data-pressable-container] span[dir="auto"]',
                     'article span[dir="auto"]',
                     '[role="article"] span[dir="auto"]',
                 ]
-                seen = set(comment_texts)
                 for sel in selectors:
                     try:
                         nodes = await page.query_selector_all(sel)
                         for node in nodes:
                             t = (await node.inner_text()).strip()
-                            if 8 <= len(t) <= 300 and t not in seen:
-                                seen.add(t)
-                                comment_texts.append(t)
+                            if 8 <= len(t) <= 300 and t not in seen_texts:
+                                seen_texts.add(t)
+                                unique_comments.append(t)
                     except Exception:
                         pass
 
-            # 去掉帖子原文（第一条通常是作者自己的内容）
-            result["comments"] = comment_texts[:10]
+            result["comments"] = unique_comments[:10]
 
             print(
                 f"[Threads] views={result['views']} | likes={result['likes']} | "
@@ -248,66 +256,79 @@ async def scrape_threads() -> dict:
 
 # ─────────────────────────────────────────────
 # 2. Supabase 统计
+# 表名：tarot_history
+# 字段：id, created_at, card_name, is_reversed,
+#       spread_type, anonymous_id, question
+#
+# 翻牌次数逻辑：
+#   一次占卜插入 1/3/10 行（每张牌一行），
+#   用 DISTINCT anonymous_id + created_at 去重才是真实占卜次数
 # ─────────────────────────────────────────────
 
 def query_supabase() -> dict:
     stats = {
-        "today_visits": 0,    # 今日访问量（页面访问记录，如有）
-        "today_flips": 0,     # 今日翻牌数
-        "total_flips": 0,     # 累计总翻牌数
-        "today_questions": [], # 今日去重问题
+        "today_flips": 0,
+        "total_flips": 0,
+        "today_questions": [],
         "error": None,
     }
 
     try:
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         start_utc, end_utc = beijing_today_utc_range()
-        print(f"[Supabase] 北京今日 UTC 范围: {start_utc}  ~  {end_utc}")
+        print(f"[Supabase] 北京今日 UTC: {start_utc} ~ {end_utc}")
 
-        # ── 今日翻牌数 ──────────────────────────────────
-        today_resp = (
-            supabase.table("readings")
-            .select("id", count="exact")
+        # ── 今日翻牌次数（真实去重）──────────────────
+        # 每次占卜的所有牌共享同一个 anonymous_id + created_at（同秒）
+        # 用 DISTINCT(anonymous_id, created_at) 计数
+        # Supabase Python SDK 不直接支持 DISTINCT 聚合，改用 RPC 或拉数据在 Python 去重
+        today_rows = (
+            supabase.table("tarot_history")
+            .select("anonymous_id, created_at")
             .gte("created_at", start_utc)
             .lt("created_at", end_utc)
             .execute()
         )
-        stats["today_flips"] = today_resp.count or 0
+        today_data = today_rows.data or []
+        # Python 端去重：同一个 anonymous_id 在同一秒的算一次
+        today_sessions = set()
+        for row in today_data:
+            anon = row.get("anonymous_id", "")
+            # 截断到秒级做去重 key
+            created = str(row.get("created_at", ""))[:19]
+            today_sessions.add(f"{anon}|{created}")
+        stats["today_flips"] = len(today_sessions)
 
-        # ── 累计总翻牌数 ────────────────────────────────
-        total_resp = (
-            supabase.table("readings")
-            .select("id", count="exact")
+        # ── 累计总翻牌次数（真实去重）───────────────
+        # 数据量大，分批拉可能很慢；改用 count 行数 / 平均牌数 近似，
+        # 或拉全量去重（163K 行约 1~2s）
+        total_rows = (
+            supabase.table("tarot_history")
+            .select("anonymous_id, created_at")
             .execute()
         )
-        stats["total_flips"] = total_resp.count or 0
+        total_data = total_rows.data or []
+        total_sessions = set()
+        for row in total_data:
+            anon = row.get("anonymous_id", "")
+            created = str(row.get("created_at", ""))[:19]
+            total_sessions.add(f"{anon}|{created}")
+        stats["total_flips"] = len(total_sessions)
 
-        # ── 今日访问量（尝试 page_views 表，不存在则跳过）──
-        try:
-            visit_resp = (
-                supabase.table("page_views")
-                .select("id", count="exact")
-                .gte("created_at", start_utc)
-                .lt("created_at", end_utc)
-                .execute()
-            )
-            stats["today_visits"] = visit_resp.count or 0
-        except Exception:
-            stats["today_visits"] = None  # 表不存在，不报错
-
-        # ── 今日去重问题（最新 100 条）──────────────────
-        q_resp = (
-            supabase.table("readings")
+        # ── 今日去重问题（最新 100 条）───────────────
+        # 问题字段名：question
+        q_rows = (
+            supabase.table("tarot_history")
             .select("question, created_at")
             .gte("created_at", start_utc)
             .lt("created_at", end_utc)
             .not_.is_("question", "null")
             .order("created_at", desc=True)
-            .limit(300)
+            .limit(500)
             .execute()
         )
         seen_q, unique_q = set(), []
-        for row in (q_resp.data or []):
+        for row in (q_rows.data or []):
             q = (row.get("question") or "").strip()
             if q and q not in seen_q:
                 seen_q.add(q)
@@ -329,7 +350,7 @@ def query_supabase() -> dict:
 
 
 # ─────────────────────────────────────────────
-# 3. 飞书通知
+# 3. 飞书富文本卡片
 # ─────────────────────────────────────────────
 
 def send_feishu(threads: dict, db: dict):
@@ -339,30 +360,25 @@ def send_feishu(threads: dict, db: dict):
     # 评论区块
     if threads["comments"]:
         comments_md = "\n".join(
-            f"{i}. {c[:100]}{'…' if len(c) > 100 else ''}"
+            f"{i}. {c[:120]}{'…' if len(c) > 120 else ''}"
             for i, c in enumerate(threads["comments"], 1)
         )
     else:
         comments_md = "（暂未获取到回复内容）"
 
-    # 问题区块
+    # 问题区块（前 20 条展示，全部存档）
     if questions:
-        q_md = "\n".join(
+        q_lines = "\n".join(
             f"{i}. {q[:80]}{'…' if len(q) > 80 else ''}"
             for i, q in enumerate(questions[:20], 1)
         )
         if len(questions) > 20:
-            q_md += f"\n… 共 {len(questions)} 条，展示前 20 条"
+            q_lines += f"\n… 共 {len(questions)} 条，仅展示最新 20 条"
     else:
-        q_md = "（今日暂无问题）"
+        q_lines = "（今日暂无问题）"
 
-    threads_err = f"\n⚠️ {threads['error']}" if threads.get("error") else ""
-    db_err = f"\n⚠️ {db['error']}" if db.get("error") else ""
-
-    # 访问量行（可选）
-    visit_line = ""
-    if db.get("today_visits") is not None:
-        visit_line = f"🌐 今日访问量：**{fmt_num(db['today_visits'])}** 次\n"
+    threads_err = f"\n⚠️ 抓取异常：{threads['error']}" if threads.get("error") else ""
+    db_err = f"\n⚠️ 数据库异常：{db['error']}" if db.get("error") else ""
 
     card = {
         "msg_type": "interactive",
@@ -370,12 +386,14 @@ def send_feishu(threads: dict, db: dict):
             "schema": "2.0",
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "🔮 塔罗项目·今日运营深度看板"},
+                "title": {
+                    "tag": "plain_text",
+                    "content": "🔮 塔罗项目·今日运营深度看板"
+                },
                 "template": "purple",
             },
             "body": {
                 "elements": [
-                    # 报告时间
                     {
                         "tag": "markdown",
                         "content": f"**📅 报告时间：** {run_time}（北京时间）"
@@ -390,27 +408,27 @@ def send_feishu(threads: dict, db: dict):
                             f"👁 浏览量：**{fmt_num(threads['views'])}**　　"
                             f"❤️ 点赞：**{fmt_num(threads['likes'])}**\n"
                             f"🔁 转发：**{fmt_num(threads['reposts'])}**　　"
-                            f"💬 回复：**{fmt_num(threads['replies'])}**"
+                            f"💬 回复数：**{fmt_num(threads['replies'])}**"
                             f"{threads_err}"
                         ),
                     },
                     {"tag": "hr"},
 
-                    # 今日新增回复
+                    # 最新回复内容（时间倒序）
                     {
                         "tag": "markdown",
-                        "content": f"**💬 最新 10 条回复内容**\n{comments_md}"
+                        "content": f"**💬 最新 10 条回复内容（时间倒序）**\n{comments_md}"
                     },
                     {"tag": "hr"},
 
-                    # Supabase 翻牌统计
+                    # 翻牌统计
                     {
                         "tag": "markdown",
                         "content": (
-                            "**🗃️ 翻牌数据统计**\n"
-                            f"{visit_line}"
-                            f"🌅 今日翻牌（北京时间）：**{fmt_num(db['today_flips'])}** 次\n"
-                            f"📊 累计总翻牌：**{fmt_num(db['total_flips'])}** 次"
+                            "**🃏 翻牌数据统计（北京时间今日零点起）**\n"
+                            f"🌅 今日翻牌次数：**{fmt_num(db['today_flips'])}** 次\n"
+                            f"📊 累计总翻牌次数：**{fmt_num(db['total_flips'])}** 次\n"
+                            f"*（已按 anonymous_id + 时间戳去重，排除同次占卜多张牌的重复行）*"
                             f"{db_err}"
                         ),
                     },
@@ -420,12 +438,11 @@ def send_feishu(threads: dict, db: dict):
                     {
                         "tag": "markdown",
                         "content": (
-                            f"**❓ 今日用户提问（去重后共 {len(questions)} 条）**\n{q_md}"
+                            f"**❓ 今日用户提问（去重后共 {len(questions)} 条）**\n{q_lines}"
                         )
                     },
                     {"tag": "hr"},
 
-                    # 底部
                     {
                         "tag": "markdown",
                         "content": "🤖 *由 GitHub Actions 定时触发 · Zen Tarot 运营机器人*"
