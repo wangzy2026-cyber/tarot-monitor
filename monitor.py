@@ -1,25 +1,24 @@
-import os
-import requests
-import json
-from datetime import datetime, timezone, timedelta
-from supabase import create_client, Client
-
-# --- 配置 ---
-SUPABASE_URL = "https://ybragvmvirddqfotqxig.supabase.co"
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
-BEIJING_TZ = timezone(timedelta(hours=8))
-
 def get_stats():
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    today_bj = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_utc = today_bj.astimezone(timezone.utc).isoformat()
     
-    res = supabase.table("tarot_history").select("anonymous_id").gte("created_at", today_utc).execute()
+    # 1. 获取北京时间当前的 0 点
+    now_bj = datetime.now(BEIJING_TZ)
+    today_bj_00 = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # 2. 关键：将北京 0 点转换为对应的 UTC 时间，去数据库里查
+    # 比如北京 4月6日 00:00 -> 对应 UTC 4月5日 16:00
+    start_time_utc = today_bj_00.astimezone(timezone.utc).isoformat()
+    
+    print(f"当前北京时间: {now_bj}")
+    print(f"统计起始时间 (UTC): {start_time_utc}")
+    
+    # 查询今日数据
+    res = supabase.table("tarot_history").select("anonymous_id").gte("created_at", start_time_utc).execute()
     data = res.data or []
     total_flips = len(data)
     uv = len(set(row['anonymous_id'] for row in data))
     
+    # 获取最新提问 (逻辑保持不变)
     q_res = supabase.table("tarot_history").select("question, created_at").not_.is_("question", "null").order("created_at", desc=True).limit(200).execute()
     seen, qs = set(), []
     for row in (q_res.data or []):
@@ -30,26 +29,5 @@ def get_stats():
             bj_time = utc_dt.astimezone(BEIJING_TZ).strftime("%H:%M")
             qs.append(f"[{bj_time}] {q}")
         if len(qs) >= 20: break
+        
     return uv, total_flips, qs
-
-def push_feishu(uv, flips, qs):
-    q_text = "\n".join(qs) if qs else "今日暂无提问"
-    now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "header": {"title": {"tag": "plain_text", "content": "🔮 Zen Tarot 运营速报"}, "template": "purple"},
-            "elements": [
-                {"tag": "markdown", "content": f"**📊 今日数据**\n👤 UV：**{uv}**\n🃏 翻牌总数：**{flips}**\n🕒 时间：{now_str}"},
-                {"tag": "hr"},
-                {"tag": "markdown", "content": f"**❓ 最新提问**\n{q_text}"}
-            ]
-        }
-    }
-    r = requests.post(FEISHU_WEBHOOK, json=payload)
-    print(f"飞书返回: {r.text}")
-
-if __name__ == "__main__":
-    if SUPABASE_KEY:
-        uv_val, flips_val, qs_val = get_stats()
-        push_feishu(uv_val, flips_val, qs_val)
