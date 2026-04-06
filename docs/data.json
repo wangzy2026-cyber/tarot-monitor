@@ -1,1 +1,13 @@
-{}
+{
+  "threads": {
+    "views": "N/A",
+    "likes": "7855",
+    "replies": "N/A",
+    "error": null
+  },
+  "supabase": {
+    "today_flips": 25403,
+    "total_flips": 177571
+  },
+  "last_updated": "2026-04-06 12:20:16"
+}
