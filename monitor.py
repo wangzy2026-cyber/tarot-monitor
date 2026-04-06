@@ -3,61 +3,83 @@ import requests
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 
-# --- 1. 基础配置 ---
+# --- 1. 配置 ---
 SUPABASE_URL = "https://ybragvmvirddqfotqxig.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-def get_final_data():
+def get_data():
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     
-    # --- 逻辑 A: 获取 14141 和 982 那组数据 ---
-    # 模拟 SQL: WHERE DATE(created_at) = CURRENT_DATE
-    # 我们取北京时间今天 0 点对应的 UTC 时间戳
-    today_bj = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc = today_bj.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # 设定北京时间今日日期字符串 (例如 '2026-04-06')
+    today_str = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')
     
-    # 查总次数 (Exact Count)
-    res_count = supabase.table("tarot_history").select("id", count="exact").gte("created_at", start_utc).limit(1).execute()
-    total_flips = res_count.count
+    print(f"--- 正在提取 {today_str} 的精准数据 ---")
+
+    # --- 核心逻辑 A: 获取总次数 ---
+    # 利用 Supabase 的文本搜索或过滤器，模拟 DATE(created_at)
+    # 我们直接用最原始的 gte 和 lt 锁定北京时间的这 24 小时
+    start_utc = (datetime.now(BEIJING_TZ).replace(hour=0,minute=0,second=0,microsecond=0)).astimezone(timezone.utc).isoformat()
+    end_utc = (datetime.now(BEIJING_TZ).replace(hour=23,minute=59,second=59,microsecond=0)).astimezone(timezone.utc).isoformat()
+
+    # 直接拿 Exact Count，不拉取数据体，彻底解决翻倍问题
+    res_count = supabase.table("tarot_history")\
+        .select("id", count="exact")\
+        .gte("created_at", start_utc)\
+        .lte("created_at", end_utc)\
+        .limit(1).execute()
     
-    # 查独立用户 (UV) - 循环抓取直到抓完所有 ID
+    total_flips = res_count.count if res_count.count else 0
+
+    # --- 核心逻辑 B: 获取独立用户 (UV) ---
+    # 为了绝对准确，我们只拉取 anonymous_id，并强制按 id 排序分页，防止重复抓取
     all_users = set()
-    offset = 0
+    last_id = "00000000-0000-0000-0000-000000000000" # UUID 初始值
+    
     while True:
-        r = supabase.table("tarot_history").select("anonymous_id").gte("created_at", start_utc).range(offset, offset + 999).execute()
-        if not r.data: break
-        all_users.update([row['anonymous_id'] for row in r.data])
-        if len(r.data) < 1000: break
-        offset += 1000
+        r = supabase.table("tarot_history")\
+            .select("id, anonymous_id")\
+            .gte("created_at", start_utc)\
+            .lte("created_at", end_utc)\
+            .gt("id", last_id)\
+            .order("id")\
+            .limit(1000).execute()
+        
+        batch = r.data or []
+        if not batch: break
+        
+        for row in batch:
+            all_users.add(row['anonymous_id'])
+            last_id = row['id'] # 记录最后一条 UUID 游标
+            
+        if len(batch) < 1000: break
+    
     uv = len(all_users)
 
-    # --- 逻辑 B: 获取最新提问列表 (严格对齐你截图里的 SQL) ---
-    # 排除 null, 长度 > 2, 倒序
+    # --- 核心逻辑 C: 最新提问 ---
     q_res = supabase.table("tarot_history")\
         .select("question")\
         .not_.is_("question", "null")\
         .order("created_at", desc=True)\
-        .limit(100).execute()
+        .limit(50).execute()
     
-    seen_qs = set()
-    final_qs = []
+    qs = []
+    seen = set()
     for row in (q_res.data or []):
         q = (row['question'] or "").strip()
-        if len(q) > 2 and q not in seen_qs:
-            seen_qs.add(q)
-            final_qs.append(f"· {q}")
-        if len(final_qs) >= 10: break # 取前10条最稳
+        if len(q) > 2 and q not in seen:
+            seen.add(q)
+            qs.append(f"· {q}")
+        if len(qs) >= 10: break
             
-    return uv, total_flips, final_qs
+    return uv, total_flips, qs
 
 def push_to_feishu(uv, flips, qs):
-    # 既然卡片老是报错，我们就用飞书最原始、最不可能报错的 text 格式
-    # 这也是为了确保你“能收到”
-    time_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+    time_str = datetime.now(BEIJING_TZ).strftime("%H:%M")
     
-    message_text = (
+    # 纯文本格式是目前最稳的，绝对不会因为 JSON 嵌套报错
+    message = (
         f"🔮 **Zen Tarot 运营简报**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📅 统计日期：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')}\n"
@@ -66,23 +88,12 @@ def push_to_feishu(uv, flips, qs):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"❓ **最新提问：**\n" + "\n".join(qs) + "\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ 更新时间：{time_str}"
+        f"⏰ 更新时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')} {time_str}"
     )
 
-    payload = {
-        "msg_type": "text",
-        "content": {
-            "text": message_text
-        }
-    }
-    
-    r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
-    print(f"飞书返回结果: {r.text}")
+    payload = {"msg_type": "text", "content": {"text": message}}
+    requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
 
 if __name__ == "__main__":
-    try:
-        u, f, q = get_final_data()
-        push_to_feishu(u, f, q)
-        print(f"✅ 成功! 抓取到 UV={u}, Flips={f}")
-    except Exception as e:
-        print(f"❌ 还是崩了: {e}")
+    u, f, q = get_data()
+    push_to_feishu(u, f, q)
