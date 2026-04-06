@@ -1,4 +1,2 @@
-supabase==2.10.0
-playwright==1.44.0
-requests==2.32.3
-python-dateutil==2.9.0
+requests
+supabase
