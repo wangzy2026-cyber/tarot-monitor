@@ -3,57 +3,58 @@ import requests
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 
-# --- 配置 ---
+# --- 1. 配置 ---
 SUPABASE_URL = "https://ybragvmvirddqfotqxig.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-def get_final_stats():
+def get_data_no_bullshit():
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     
-    # --- 核心：手动强制锁定北京时间 4月6日的 UTC 范围 ---
-    # 北京时间 4/6 00:00 = UTC时间 4/5 16:00
-    # 北京时间 4/6 23:59 = UTC时间 4/6 15:59
-    start_utc = "2026-04-05T16:00:00.000Z"
-    end_utc = "2026-04-06T15:59:59.999Z"
+    # 这一步是核心：我们不再自己算 UTC，我们问数据库现在是北京时间几号
+    db_now = supabase.rpc("get_bj_date").execute()
+    # 如果 rpc 没建，我们手动定死：
+    target_date = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')
     
-    print(f"--- 正在提取 UTC 范围: {start_utc} 至 {end_utc} ---")
+    print(f"--- 目标日期: {target_date} ---")
 
-    # 1. 抓取总次数 (Exact Count)
-    res_count = supabase.table("tarot_history")\
-        .select("id", count="exact")\
-        .gte("created_at", start_utc)\
-        .lte("created_at", end_utc)\
-        .limit(1).execute()
-    total_flips = res_count.count if res_count.count else 0
-
-    # 2. 抓取独立用户 (UV) - 暴力翻页抓取所有 anonymous_id
-    all_users = set()
-    offset = 0
-    while True:
-        r = supabase.table("tarot_history")\
-            .select("anonymous_id")\
-            .gte("created_at", start_utc)\
-            .lte("created_at", end_utc)\
-            .range(offset, offset + 999).execute()
-        
-        if not r.data: break
-        all_users.update([row['anonymous_id'] for row in r.data])
-        if len(r.data) < 1000: break
-        offset += 1000
+    # --- 彻底放弃 range 和 gte，改用 filter 匹配日期字符串 ---
+    # 这种写法在 Supabase 里最稳，直接匹配数据库转换后的日期字符串
+    res = supabase.table("tarot_history")\
+        .select("anonymous_id")\
+        .filter("created_at", "gte", f"{target_date} 00:00:00+08")\
+        .filter("created_at", "lte", f"{target_date} 23:59:59+08")\
+        .execute()
     
-    uv = len(all_users)
+    raw_data = res.data or []
+    total_flips = len(raw_data)
+    uv = len(set(item['anonymous_id'] for item in raw_data))
 
-    # 3. 获取最新提问
+    # 如果上面那个数据还是大的离谱，说明 gte 还是失效了
+    # 我们用最后一招：拉取最近 20000 条，在 Python 里根据字符串强行过滤
+    if total_flips > 20000:
+        print("检测到数据异常，启动强力物理过滤...")
+        res_brute = supabase.table("tarot_history")\
+            .select("anonymous_id, created_at")\
+            .order("created_at", desc=True)\
+            .limit(20000).execute()
+            
+        filtered = [
+            row for row in (res_brute.data or [])
+            if (datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) + timedelta(hours=8)).strftime('%Y-%m-%d') == target_date
+        ]
+        total_flips = len(filtered)
+        uv = len(set(row['anonymous_id'] for row in filtered))
+
+    # 获取提问列表 (去重)
     q_res = supabase.table("tarot_history")\
         .select("question")\
         .not_.is_("question", "null")\
         .order("created_at", desc=True)\
-        .limit(30).execute()
+        .limit(50).execute()
     
-    qs = []
-    seen = set()
+    seen, qs = set(), []
     for row in (q_res.data or []):
         q = (row['question'] or "").strip()
         if len(q) > 2 and q not in seen:
@@ -64,25 +65,20 @@ def get_final_stats():
     return uv, total_flips, qs
 
 def push_to_feishu(uv, flips, qs):
-    # 纯文本发送，杜绝一切格式错误
+    time_str = datetime.now(BEIJING_TZ).strftime("%H:%M")
     message = (
         f"🔮 **Zen Tarot 运营简报**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 统计日期：2026-04-06\n"
+        f"📅 统计日期：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')}\n"
         f"👤 独立用户 (UV)：**{uv}**\n"
         f"🃏 占卜总次数：**{flips}**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"❓ **最新提问：**\n" + "\n".join(qs) + "\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ 更新时间：{datetime.now(BEIJING_TZ).strftime('%H:%M')}"
+        f"⏰ 更新时间：{time_str}"
     )
-
-    payload = {"msg_type": "text", "content": {"text": message}}
-    requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
+    requests.post(FEISHU_WEBHOOK, json={"msg_type": "text", "content": {"text": message}})
 
 if __name__ == "__main__":
-    try:
-        u, f, q = get_final_stats()
-        push_to_feishu(u, f, q)
-    except Exception as e:
-        print(f"报错: {e}")
+    u, f, q = get_data_no_bullshit()
+    push_to_feishu(u, f, q)
