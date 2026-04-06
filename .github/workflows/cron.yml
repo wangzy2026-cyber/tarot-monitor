@@ -2,25 +2,18 @@ name: 🔮 Zen Tarot Feishu Bot
 
 on:
   schedule:
-    - cron: '0 * * * *' # 每小时运行一次
-  workflow_dispatch:   # 允许你点击按钮手动运行
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
 jobs:
   update-bot:
     runs-on: ubuntu-latest
     steps:
-      - name: ⬇️ Checkout
-        uses: actions/checkout@v4
-
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 📦 Install Deps
-        run: pip install requests supabase
-
-      - name: 🚀 Run Monitor
-        env:
+      - run: pip install requests supabase
+      - env:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python monitor.py
