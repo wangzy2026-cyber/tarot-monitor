@@ -9,79 +9,81 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-def get_stats_force():
+def get_accurate_data():
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     
-    # 锁定北京时间 2026-04-06 的 UTC 范围
-    # 4/6 00:00 BJ = 4/5 16:00 UTC
-    # 4/6 23:59 BJ = 4/6 15:59 UTC
-    start_utc = "2026-04-05T16:00:00.000Z"
-    end_utc = "2026-04-06T15:59:59.999Z"
+    # 1. 严格锁定北京时间今日 0 点对应的 UTC 时间
+    now_bj = datetime.now(BEIJING_TZ)
+    today_0am_bj = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = today_0am_bj.astimezone(timezone.utc).isoformat()
     
-    print(f"--- 物理扫表开始: {start_utc} 至 {end_utc} ---")
+    print(f"--- 统计开始时间 (UTC): {start_utc} ---")
 
-    all_raw_data = []
+    # 2. 物理拉取今日所有 ID (防止数据库 Count 逻辑漂移)
+    # 我们只拉取 anonymous_id，分批次拉取
+    all_ids = []
     offset = 0
-    
-    # 物理扫表：一页一页拉，直到拉完 1.4 万条
     while True:
-        res = supabase.table("tarot_history") \
-            .select("anonymous_id") \
-            .gte("created_at", start_utc) \
-            .lte("created_at", end_utc) \
-            .range(offset, offset + 999) \
-            .execute()
+        # 使用 order("id") 确保分页绝对稳定，不重不漏
+        res = supabase.table("tarot_history")\
+            .select("anonymous_id")\
+            .gte("created_at", start_utc)\
+            .order("id")\
+            .range(offset, offset + 999).execute()
         
         batch = res.data or []
-        if not batch:
-            break
-        all_raw_data.extend(batch)
-        print(f"已拉取 {len(all_raw_data)} 条...")
+        all_ids.extend([row['anonymous_id'] for row in batch])
         if len(batch) < 1000:
             break
         offset += 1000
-
-    # 在内存里物理点数
-    total_flips = len(all_raw_data)
-    uv = len(set(item['anonymous_id'] for item in all_raw_data))
     
-    print(f"物理点数完成: UV={uv}, Flips={total_flips}")
+    total_flips = len(all_ids)
+    uv = len(set(all_ids))
 
-    # 获取最新 5 条提问
+    # 3. 抓取最新的 30 条问题
     q_res = supabase.table("tarot_history")\
-        .select("question")\
+        .select("question, created_at")\
         .not_.is_("question", "null")\
         .order("created_at", desc=True)\
-        .limit(30).execute()
+        .limit(60).execute() # 多取一点用来去重
     
-    seen, qs = set(), []
+    seen_qs = set()
+    final_qs = []
     for row in (q_res.data or []):
         q = (row['question'] or "").strip()
-        if len(q) > 2 and q not in seen:
-            seen.add(q)
-            qs.append(f"· {q}")
-        if len(qs) >= 5: break
+        if len(q) > 2 and q not in seen_qs:
+            seen_qs.add(q)
+            # 转换时间格式
+            utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+            bj_time = utc_time.astimezone(BEIJING_TZ).strftime("%H:%M")
+            final_qs.append(f"· [{bj_time}] {q}")
+        if len(final_qs) >= 30: break
             
-    return uv, total_flips, qs
+    return uv, total_flips, final_qs
 
 def push_to_feishu(uv, flips, qs):
-    time_str = datetime.now(BEIJING_TZ).strftime("%H:%M")
+    now_str = datetime.now(BEIJING_TZ).strftime("%H:%M")
+    
+    # 构建飞书消息
     message = (
-        f"🔮 **Zen Tarot 运营简报**\n"
+        f"🔮 **Zen Tarot 半小时简报**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 统计日期：2026-04-06\n"
-        f"👤 独立用户 (UV)：**{uv}**\n"
-        f"🃏 占卜总次数：**{flips}**\n"
+        f"📅 统计日期：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d')}\n"
+        f"👤 今日独立用户 (UV)：**{uv}**\n"
+        f"🃏 今日占卜总次数：**{flips}**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"❓ **最新提问：**\n" + "\n".join(qs) + "\n"
+        f"❓ **最新 30 个问题：**\n" + "\n".join(qs) + "\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ 更新时间：{time_str}"
+        f"⏰ 更新时间：{now_str} (每30分钟自动抓取)"
     )
-    requests.post(FEISHU_WEBHOOK, json={"msg_type": "text", "content": {"text": message}})
+
+    payload = {"msg_type": "text", "content": {"text": message}}
+    requests.post(FEISHU_WEBHOOK, json=payload, timeout=15)
 
 if __name__ == "__main__":
     try:
-        u, f, q = get_stats_force()
+        u, f, q = get_accurate_data()
         push_to_feishu(u, f, q)
+        print(f"✅ 执行成功: UV={u}, Flips={f}")
     except Exception as e:
-        print(f"❌ 运行报错: {e}")
+        print(f"❌ 运行失败: {e}")
