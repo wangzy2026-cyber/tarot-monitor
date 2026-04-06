@@ -13,8 +13,6 @@ jobs:
     timeout-minutes: 15
 
     env:
-      # 从 GitHub Secrets 读取敏感配置（推荐）
-      # 若未配置 Secret，脚本内已有硬编码 fallback
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
     steps:
@@ -35,39 +33,66 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. 修复 Ubuntu 24.04 (Noble) libasound2 兼容问题 ──
-      - name: 🔧 Fix libasound2 for Ubuntu Noble
+      # ── 4. 手动安装 Chromium 全部系统依赖 ──────────
+      # Ubuntu 24.04 (Noble) 将 libasound2 改名为 libasound2t64
+      # playwright --with-deps 和 install-deps 均会 apt install libasound2 导致 exit 100
+      # 解决方案：用 --no-deps 完全跳过 playwright 的依赖安装，自己精确装好
+      - name: 🔧 Install Chromium system dependencies (Noble-compatible)
         run: |
           sudo apt-get update -qq
-          # Noble 上 libasound2 已改名为 libasound2t64，手动建立软链兼容
-          sudo apt-get install -y libasound2t64 libatk1.0-0 libatk-bridge2.0-0 \
-            libcups2 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 \
-            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxss1 \
-            libxtst6 xvfb --no-install-recommends 2>/dev/null || true
-          # 若系统没有 libasound2 符号包，手动创建软链让 Playwright 找到
-          if ! ldconfig -p | grep -q 'libasound.so.2'; then
-            ASOUND_LIB=$(ldconfig -p | grep 'libasound' | awk '{print $NF}' | head -1)
-            if [ -n "$ASOUND_LIB" ]; then
-              sudo ln -sf "$ASOUND_LIB" /usr/lib/x86_64-linux-gnu/libasound.so.2 2>/dev/null || true
-            fi
+          sudo apt-get install -y \
+            libasound2t64 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcairo2 \
+            libcups2 \
+            libdbus-1-3 \
+            libdrm2 \
+            libgbm1 \
+            libglib2.0-0 \
+            libgtk-3-0 \
+            libnspr4 \
+            libnss3 \
+            libpango-1.0-0 \
+            libpangocairo-1.0-0 \
+            libx11-6 \
+            libx11-xcb1 \
+            libxcb1 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxdamage1 \
+            libxext6 \
+            libxfixes3 \
+            libxi6 \
+            libxrandr2 \
+            libxrender1 \
+            libxss1 \
+            libxtst6 \
+            ca-certificates \
+            fonts-liberation \
+            xvfb \
+            --no-install-recommends
+          # 为 Playwright 创建 libasound.so.2 软链（libasound2t64 提供实际 .so 文件）
+          LIBASOUND=$(find /usr/lib/x86_64-linux-gnu -name 'libasound.so*' 2>/dev/null | head -1)
+          if [ -n "$LIBASOUND" ] && [ ! -f /usr/lib/x86_64-linux-gnu/libasound.so.2 ]; then
+            sudo ln -sf "$LIBASOUND" /usr/lib/x86_64-linux-gnu/libasound.so.2
+            echo "Symlink: $LIBASOUND -> libasound.so.2"
           fi
+          sudo ldconfig
 
-      # ── 5. 安装 Playwright 浏览器（Chromium）──────
-      - name: 🌐 Install Playwright Chromium
-        run: |
-          # 使用 --with-deps 让 playwright 自行处理依赖，跳过有问题的 install-deps
-          playwright install --with-deps chromium
+      # ── 5. 安装 Playwright Chromium（跳过 apt 依赖）──
+      - name: 🌐 Install Playwright Chromium (--no-deps)
+        run: playwright install --no-deps chromium
 
-      # ── 5. 执行监控脚本 ────────────────────────────
+      # ── 6. 执行监控脚本 ────────────────────────────
       - name: 🚀 Run monitor script
         run: python monitor.py
 
-      # ── 6. 上传日志（可选，失败时保留 7 天）────────
+      # ── 7. 上传日志（失败时保留 7 天）──────────────
       - name: 📋 Upload run log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: monitor-failure-log-${{ github.run_id }}
-          path: |
-            *.log
+          path: "*.log"
           retention-days: 7
