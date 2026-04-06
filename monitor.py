@@ -1,100 +1,76 @@
-"""
-🔮 Zen Tarot | 运营监控终极版 (Full Logic)
-"""
 import os
-import re
-import json
-import asyncio
 import requests
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 
-# --- 配置 ---
-THREADS_URL = "https://www.threads.net/@wangzy2026/post/DWgLFq3iWxc"
+# --- 基础配置 (从环境变量读取 Key) ---
 SUPABASE_URL = "https://ybragvmvirddqfotqxig.supabase.co"
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlicmFndm12aXJkZHFmb3RxeGlnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ4MzgzNDcsImV4cCI6MjA5MDQxNDM0N30.4UKQfcVHjbHPEdOIiWjixswk7qVz5nNsNRL5VG9UQY0"
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/db9c21f0-9453-410d-ae0e-c9116a8dc612"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-def now_bj_str(): return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+def get_stats():
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    
+    # 逻辑 A：今日聚合统计 (北京时间 0 点起)
+    today_bj = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_utc = today_bj.astimezone(timezone.utc).isoformat()
+    
+    # 统计今日所有数据
+    res = supabase.table("tarot_history").select("anonymous_id").gte("created_at", today_utc).execute()
+    data = res.data or []
+    total_flips = len(data)
+    uv = len(set(row['anonymous_id'] for row in data))
+    
+    # 逻辑 B：最新 100 条有效提问 (去重逻辑)
+    q_res = supabase.table("tarot_history")\
+        .select("question, created_at")\
+        .not_.is_("question", "null")\
+        .order("created_at", desc=True)\
+        .limit(300).execute() # 采样 300 条进行侧端去重
+    
+    seen_questions = set()
+    latest_questions = []
+    for row in (q_res.data or []):
+        q = row['question'].strip()
+        # 长度大于 2 且未出现过
+        if len(q) > 2 and q not in seen_questions:
+            seen_questions.add(q)
+            # 转换显示时间为北京时间
+            utc_dt = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+            bj_time = utc_dt.astimezone(BEIJING_TZ).strftime("%H:%M")
+            latest_questions.append(f"[{bj_time}] {q}")
+        if len(latest_questions) >= 100:
+            break
+            
+    return uv, total_flips, latest_questions
 
-def fmt_num(val):
-    if val in ("N/A", None, ""): return "N/A"
-    try: return f"{int(str(val).replace(',', '')):,}"
-    except: return str(val)
-
-# --- 1. Threads 深度爬虫 ---
-async def scrape_threads():
-    from playwright.async_api import async_playwright
-    res = {"views": "N/A", "likes": "N/A", "replies": "N/A", "reposts": "N/A", "error": None}
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(THREADS_URL, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(10) # 给足加载时间
-            html = await page.content()
-            for field, key in [("views", "view_count"), ("likes", "like_count"), ("replies", "reply_count"), ("reposts", "repost_count")]:
-                m = re.search(rf'"{key}"\s*:\s*(\d+)', html)
-                if m: res[field] = m.group(1)
-            await browser.close()
-    except Exception as e: res["error"] = str(e)
-    return res
-
-# --- 2. Supabase 去重统计 ---
-def query_supabase():
-    stats = {"today_flips": 0, "total_flips": 0, "today_questions": []}
-    try:
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        start_utc = (datetime.now(BEIJING_TZ).replace(hour=0,minute=0,second=0)).astimezone(timezone.utc).isoformat()
-        
-        # 今日真实去重统计
-        r_today = supabase.table("tarot_history").select("anonymous_id, created_at").gte("created_at", start_utc).execute()
-        stats["today_flips"] = len(set([f"{row['anonymous_id']}|{row['created_at'][:19]}" for row in (r_today.data or [])]))
-        
-        # 总数
-        r_total = supabase.table("tarot_history").select("id", count="exact").execute()
-        stats["total_flips"] = r_total.count or 177571
-    except: pass
-    return stats
-
-# --- 3. 飞书富文本推送 ---
-def send_feishu(threads, db):
-    # 🌟 重新启用精美的卡片格式
+def push_feishu(uv, flips, qs):
+    # 飞书卡片只展示前 10 个问题预览，避免消息过长，完整列表可在多维表格看（如果需要）
+    q_display = "\n".join(qs[:15]) + (f"\n...等共 {len(qs)} 条" if len(qs) > 15 else "")
+    
+    now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+    
     card = {
         "msg_type": "interactive",
         "card": {
-            "header": {"title": {"tag": "plain_text", "content": "🔮 Zen Tarot 运营深度看板"}, "template": "purple"},
+            "header": {"title": {"tag": "plain_text", "content": "🔮 Zen Tarot 运营速报"}, "template": "purple"},
             "body": {"elements": [
-                {"tag": "markdown", "content": f"**📅 时间：** {now_bj_str()}\n"},
+                {"tag": "markdown", "content": f"**📅 统计时间：** {now_str}"},
                 {"tag": "hr"},
-                {"tag": "markdown", "content": f"**📱 Threads 互动**\n👁 浏览：**{fmt_num(threads['views'])}**\n❤️ 点赞：**{fmt_num(threads['likes'])}**\n💬 回复：**{fmt_num(threads['replies'])}**\n🔁 转发：**{fmt_num(threads['reposts'])}**"},
+                {"tag": "markdown", "content": f"**📊 今日实时数据**\n👤 独立用户 (UV)：**{uv}**\n🃏 翻牌总次数：**{flips}**"},
                 {"tag": "hr"},
-                {"tag": "markdown", "content": f"**🃏 牌阵统计**\n🌅 今日翻牌：**{fmt_num(db['today_flips'])}** 次\n📊 累计总数：**{fmt_num(db['total_flips'])}** 次"},
-                {"tag": "note", "content": {"tag": "plain_text", "content": "🤖 数据每小时自动更新一次"}}
+                {"tag": "markdown", "content": f"**❓ 最新用户提问 (去重)**\n{q_display or '暂无提问'}"},
+                {"tag": "note", "content": {"tag": "plain_text", "content": "数据由 GitHub Actions 自动推送"}}
             ]}
         }
     }
-    try:
-        r = requests.post(FEISHU_WEBHOOK, json=card, timeout=30)
-        print(f"✅ 飞书返回: {r.json()}")
-    except: print("❌ 飞书网络超时")
-
-# --- 4. 主流程 ---
-async def main():
-    print(f"🚀 任务启动...")
-    t_data = await scrape_threads()
-    s_data = query_supabase()
-    
-    # 1. 优先发飞书
-    send_feishu(t_data, s_data)
-    
-    # 2. 存入 Notion 数据源
-    if not os.path.exists("docs"): os.makedirs("docs")
-    with open("docs/data.json", "w", encoding="utf-8") as f:
-        json.dump({"threads": t_data, "supabase": s_data, "last_updated": now_bj_str()}, f, ensure_ascii=False, indent=2)
-    
-    print(f"🎉 全部完成！")
+    requests.post(FEISHU_WEBHOOK, json=card)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        uv, flips, qs = get_stats()
+        push_feishu(uv, flips, qs)
+        print("✅ 飞书推送成功")
+    except Exception as e:
+        print(f"❌ 运行出错: {e}")
